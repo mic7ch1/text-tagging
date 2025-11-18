@@ -693,7 +693,7 @@ const App: FC = () => {
 
       // Sort boxes: left-to-right by column, then top-to-bottom within each column
       // This matches the original clustering logic
-      const sortedBoxes = sortBoxesByColumns(boxesToExport, imageWidth);
+      const sortedBoxes = sortBoxesByColumns(boxesToExport);
 
       // Generate CSV content in YOLO format
       // Format: filename, x_center, y_center, width, height (all normalized 0-1)
@@ -829,7 +829,7 @@ function bbox_overlap3(box1: BoundingBox, box2: BoundingBox, lpad: number, rpad:
  * Sort bounding boxes by columns (left-to-right) and then by rows (top-to-bottom) within each column.
  * This matches the original clustering logic for reading order.
  */
-function sortBoxesByColumns(boxes: BoundingBox[], imageWidth: number): BoundingBox[] {
+function sortBoxesByColumns(boxes: BoundingBox[]): BoundingBox[] {
     if (boxes.length === 0) return [];
     
     // Calculate center X for each box
@@ -1203,7 +1203,8 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
                         }}
                         onTap={(e) => {
                             const isSelected = selectedBoxIds.includes(box.id);
-                            if (e.evt.shiftKey) {
+                            const evt = e.evt as MouseEvent;
+                            if (evt.shiftKey) {
                                 // Multi-select mode: toggle the clicked box
                                 if (isSelected) {
                                     setSelectedBoxIds(selectedBoxIds.filter(id => id !== box.id));
@@ -1283,10 +1284,9 @@ interface TagClassesPanelProps {
     boxes: BoundingBox[];
     onBoxClassChange: (boxIds: number[], boxClass: BoxClass | undefined) => void;
     selectedBoxIds: number[];
-    onSelectedBoxIdsChange: (boxIds: number[]) => void;
 }
 
-const TagClassesPanel: FC<TagClassesPanelProps> = ({ boxes, onBoxClassChange, selectedBoxIds, onSelectedBoxIdsChange }) => {
+const TagClassesPanel: FC<TagClassesPanelProps> = ({ boxes, onBoxClassChange, selectedBoxIds }) => {
     const selectedBoxes = boxes.filter(box => selectedBoxIds.includes(box.id));
     const classOptions: BoxClass[] = ['Man', 'Chi', 'Frame'];
     
