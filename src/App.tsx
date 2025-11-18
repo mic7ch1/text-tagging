@@ -1,12 +1,13 @@
 import { useState, useEffect, type FC, type ChangeEvent, type DragEvent, useRef } from 'react';
 import ReactCrop, { type Crop } from 'react-image-crop';
-import { kmeans } from 'ml-kmeans';
 import { Stage, Layer, Image as KonvaImage, Rect as KonvaRect, Transformer } from 'react-konva';
 import type { KonvaEventObject } from 'konva/lib/Node';
 import 'react-image-crop/dist/ReactCrop.css';
 import './App.css';
 import { loadCv } from './cv-loader';
 import { useTheme } from './theme-provider';
+
+type BoxClass = 'Man' | 'Chi' | 'Frame';
 
 interface BoundingBox {
     x: number;
@@ -17,7 +18,8 @@ interface BoundingBox {
     id: number;
     cluster?: number;
     centroidX?: number;
-    text?: string; // Add text field
+    text?: string;
+    class?: BoxClass; // Class tag for YOLO training
 }
 
 interface PreprocessSettings {
@@ -55,7 +57,7 @@ interface TextDetectionSettings {
   cropPaddingWidth: number;
 }
 
-const steps = ['Settings & Crop', 'Fine-tune', 'Text Matching'];
+const steps = ['Settings & Crop', 'Fine-tune', 'Tag Classes', 'Export Coordinates'];
 
 interface AppStepperProps {
   currentStep: number;
@@ -145,9 +147,7 @@ const App: FC = () => {
   });
   const [textDetectionImage, setTextDetectionImage] = useState<string | null>(null);
   const [finalBoundingBoxes, setFinalBoundingBoxes] = useState<BoundingBox[]>([]);
-  const [clusteredBoxes, setClusteredBoxes] = useState<BoundingBox[]>([]);
   const [excludedIndices] = useState<number[]>([]);
-  const [translationText, setTranslationText] = useState<string>('');
   const fineTunePanelRef = useRef<HTMLDivElement>(null);
   const leftPanelRef = useRef<HTMLDivElement>(null);
   const contentAreaRef = useRef<HTMLDivElement>(null);
@@ -156,6 +156,7 @@ const App: FC = () => {
   const { theme, setTheme } = useTheme();
   const [isSettingsExpanded, setIsSettingsExpanded] = useState(false);
   const [isAutoNavigating, setIsAutoNavigating] = useState(false);
+  const [selectedBoxIdsForTagging, setSelectedBoxIdsForTagging] = useState<number[]>([]);
 
 
   useEffect(() => {
@@ -264,11 +265,8 @@ const App: FC = () => {
   }, [currentStep]); // Rerun when step changes to attach observer at the right time
 
   const clearStateAfter = (stepIndex: number) => {
-    if (stepIndex < 4) {
-      // Future state for step 4 could be cleared here
-    }
     if (stepIndex < 3) {
-        setClusteredBoxes([]);
+        setSelectedBoxIdsForTagging([]);
     }
     if (stepIndex < 2) {
         setTextDetectionImage(null);
@@ -278,6 +276,16 @@ const App: FC = () => {
         setPreprocessedImage(null);
     }
   }
+
+  const handleBoxClassChange = (boxIds: number[], boxClass: BoxClass | undefined) => {
+    setFinalBoundingBoxes(prevBoxes =>
+      prevBoxes.map(box =>
+        boxIds.includes(box.id) ? { ...box, class: boxClass } : box
+      )
+    );
+    // Clear selection after tagging
+    setSelectedBoxIdsForTagging([]);
+  };
 
   const handleResetSettings = () => {
     const defaultPreprocessSettings = {
@@ -334,9 +342,12 @@ const App: FC = () => {
       } else {
         console.error("handleNext: Crop failed, aborting.");
       }
-    } else if (currentStep === 1) { // Moving from Fine-tune to Text Matching
+    } else if (currentStep === 1) { // Moving from Fine-tune to Tag Classes
       if (isAutoNavigating) return; // Prevent user clicks during auto-navigation
-      performColumnDetection();
+      const nextStep = Math.min(currentStep + 1, steps.length - 1);
+      setCurrentStep(nextStep);
+      setMaxCompletedStep(Math.max(maxCompletedStep, nextStep));
+    } else if (currentStep === 2) { // Moving from Tag Classes to Export Coordinates
       const nextStep = Math.min(currentStep + 1, steps.length - 1);
       setCurrentStep(nextStep);
       setMaxCompletedStep(Math.max(maxCompletedStep, nextStep));
@@ -621,6 +632,7 @@ const App: FC = () => {
                 y: finalBox.y - padding,
                 w: finalBox.w + 2 * padding,
                 h: finalBox.h + 2 * padding,
+                class: 'Man', // Default class
             });
             processedIndices.add(primaryBox.id);
         }
@@ -648,158 +660,85 @@ const App: FC = () => {
     }
   }
 
-  const performColumnDetection = () => {
-    if (finalBoundingBoxes.length === 0) {
-      console.log("Column detection skipped: no bounding boxes.");
+
+  const handleExportCSV = async () => {
+    if (!preprocessedImage || finalBoundingBoxes.length === 0) {
+      console.warn("Export skipped: required data is missing.");
+      alert("Cannot export: Missing preprocessed image or bounding boxes.");
       return;
     }
 
-    const boxesToCluster = finalBoundingBoxes.filter(box => !excludedIndices.includes(box.id));
-    if (boxesToCluster.length === 0) {
-        setClusteredBoxes([]);
-        return;
-    }
-    
-    const centroidsX = boxesToCluster.map(box => [box.x + box.w / 2]);
-    const sortedCentroidsX = [...centroidsX.map(c => c[0])].sort((a, b) => a - b);
-    
-    const centDiff = [];
-    for (let i = 0; i < sortedCentroidsX.length - 1; i++) {
-        centDiff.push(sortedCentroidsX[i+1] - sortedCentroidsX[i]);
-    }
-    
-    const avg = centDiff.reduce((acc, val) => acc + val, 0) / centDiff.length;
-
-    let groupCount = 1;
-    if (centDiff.length > 2) {
-        for (let i = 1; i < centDiff.length - 1; i++) {
-            if (centDiff[i] > 3 * avg && centDiff[i] > centDiff[i - 1] && centDiff[i] > centDiff[i + 1]) {
-                groupCount++;
-            }
-        }
-    }
-
-    if (centroidsX.length > 0) {
-      const { clusters, centroids } = kmeans(centroidsX, groupCount, { initialization: 'kmeans++' });
-      
-      // Sort clusters by their x-coordinate to ensure left-to-right ordering
-      const sortedCentroids = centroids
-          .map((centroid, index) => ({ index, x: centroid[0] }))
-          .sort((a, b) => a.x - b.x);
-
-      const clusterMap = new Map(sortedCentroids.map((c, i) => [c.index, i]));
-
-      const updatedBoxes = boxesToCluster.map((box, i) => {
-        const originalCluster = clusters[i];
-        const newCluster = clusterMap.get(originalCluster);
-        return {
-            ...box,
-            cluster: newCluster,
-            centroidX: centroids[originalCluster][0],
-        };
-      });
-      setClusteredBoxes(updatedBoxes);
-    } else {
-        setClusteredBoxes([]);
-    }
-  };
-
-  const handleDownload = async () => {
-    if (!preprocessedImage || clusteredBoxes.length === 0 || !translationText) {
-      console.warn("Download skipped: required data is missing.");
-      alert("Cannot download: Missing preprocessed image, bounding boxes, or input text.");
-      return;
-    }
-
-    console.log("Starting download process...");
+    console.log("Starting CSV export process...");
     try {
-      const JSZip = (await import('jszip')).default;
-      const zip = new JSZip();
-      const cv = await loadCv();
-      
       const imageElement = new Image();
       imageElement.src = preprocessedImage;
       await new Promise((resolve, reject) => {
           imageElement.onload = resolve;
           imageElement.onerror = (err) => {
-            console.error("Failed to load preprocessed image for zipping.", err);
-            reject(new Error("Image loading for zip failed."));
+            console.error("Failed to load preprocessed image for export.", err);
+            reject(new Error("Image loading for export failed."));
           }
       });
-      const src = cv.imread(imageElement);
-      console.log("Preprocessed image loaded for zipping.");
-      const usedFilenames = new Map<string, number>();
-      
-      const finalBoxes = clusteredBoxes.filter(box => !excludedIndices.includes(box.id));
 
-      const clusters = new Map<number, BoundingBox[]>();
-      finalBoxes.forEach(box => {
-          const clusterId = box.cluster ?? 0;
-          if (!clusters.has(clusterId)) clusters.set(clusterId, []);
-          clusters.get(clusterId)?.push(box);
+      const imageWidth = imageElement.naturalWidth;
+      const imageHeight = imageElement.naturalHeight;
+      
+      // Filter out excluded boxes
+      const boxesToExport = finalBoundingBoxes.filter(box => !excludedIndices.includes(box.id));
+      
+      if (boxesToExport.length === 0) {
+        alert("No bounding boxes to export.");
+        return;
+      }
+
+      // Sort boxes: left-to-right by column, then top-to-bottom within each column
+      // This matches the original clustering logic
+      const sortedBoxes = sortBoxesByColumns(boxesToExport, imageWidth);
+
+      // Generate CSV content in YOLO format
+      // Format: filename, x_center, y_center, width, height (all normalized 0-1)
+      const csvLines: string[] = [];
+      
+      // Use the original filename
+      const filename = originalFileName || 'image.jpg';
+      
+      sortedBoxes.forEach(box => {
+        // Calculate YOLO format coordinates (normalized 0-1)
+        const x_center = (box.x + box.w / 2) / imageWidth;
+        const y_center = (box.y + box.h / 2) / imageHeight;
+        const width = box.w / imageWidth;
+        const height = box.h / imageHeight;
+        
+        // Ensure values are within [0, 1] range
+        const normalized_x_center = Math.max(0, Math.min(1, x_center));
+        const normalized_y_center = Math.max(0, Math.min(1, y_center));
+        const normalized_width = Math.max(0, Math.min(1, width));
+        const normalized_height = Math.max(0, Math.min(1, height));
+        
+        // Get class, default to empty string if not set
+        const boxClass = box.class || '';
+        
+        csvLines.push(`${filename},${boxClass},${normalized_x_center.toFixed(6)},${normalized_y_center.toFixed(6)},${normalized_width.toFixed(6)},${normalized_height.toFixed(6)}`);
       });
-
-      const sortedClusterKeys = Array.from(clusters.keys()).sort((a, b) => a - b);
-      let filesAdded = 0;
-
-      for (let i = 0; i < sortedClusterKeys.length; i++) {
-          const clusterKey = sortedClusterKeys[i];
-          const boxesInCluster = (clusters.get(clusterKey) || []).sort((a, b) => a.y - b.y);
-          const textInColumn = (translationText.split('\n')[i] || '').split(/\s+/).filter(Boolean);
-
-          boxesInCluster.forEach((box, wordIndex) => {
-              const word = textInColumn[wordIndex];
-              if (word) {
-                  try {
-                      const rect = new cv.Rect(Math.round(box.x), Math.round(box.y), Math.round(box.w), Math.round(box.h));
-
-                      if (rect.x < 0) rect.x = 0;
-                      if (rect.y < 0) rect.y = 0;
-                      if (rect.x + rect.width > src.cols) rect.width = src.cols - rect.x;
-                      if (rect.y + rect.height > src.rows) rect.height = src.rows - rect.y;
-
-                      if (rect.width <= 0 || rect.height <= 0) return;
-
-                      const dst = src.roi(rect);
-                      const canvas = document.createElement('canvas');
-                      cv.imshow(canvas, dst);
-                      
-                      const imageData = canvas.toDataURL('image/png');
-                      const safeWord = word.replace(/[/\\?%*:|"<>]/g, '-');
-                      
-                      const count = usedFilenames.get(safeWord) || 0;
-                      const finalFilename = count === 0 ? `${safeWord}.png` : `${safeWord}-${count}.png`;
-                      usedFilenames.set(safeWord, count + 1);
-
-                      zip.file(finalFilename, imageData.split(',')[1], { base64: true });
-                      filesAdded++;
-                      dst.delete();
-                  } catch (e) {
-                      console.error(`Error processing word "${word}" with box:`, box, e);
-                  }
-              }
-          });
-      }
       
-      src.delete();
+      // Create CSV content with header
+      const csvContent = ['filename,class,x_center,y_center,width,height', ...csvLines].join('\n');
       
-      if (filesAdded > 0) {
-        zip.generateAsync({ type: 'blob' }).then(content => {
-          const link = document.createElement('a');
-          link.href = URL.createObjectURL(content);
-          const nameWithoutExtension = originalFileName.split('.').slice(0, -1).join('.') || 'manchu_text_pairs';
-          link.download = `${nameWithoutExtension}.zip`;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          URL.revokeObjectURL(link.href);
-        });
-      } else {
-        alert("No words were matched to bounding boxes. The ZIP file will be empty.");
-      }
+      // Create download link
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      const nameWithoutExtension = originalFileName.split('.').slice(0, -1).join('.') || 'yolo_coordinates';
+      link.download = `${nameWithoutExtension}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(link.href);
+      
+      console.log(`Exported ${boxesToExport.length} bounding boxes to CSV.`);
     } catch (error) {
-        console.error("Failed to generate ZIP file:", error);
-        alert("An error occurred while generating the ZIP file. Check the console for details.");
+        console.error("Failed to export CSV file:", error);
+        alert("An error occurred while exporting the CSV file. Check the console for details.");
     }
   };
 
@@ -839,8 +778,16 @@ const App: FC = () => {
                     onReset={handleResetSettings}
                   />
                 )}
-                {currentStep === 1 && <div className="panel-container"><h3>Fine-Tune Detections</h3><p>Click and drag on empty space to draw a new box.<br/>Click a box to select it for moving or resizing.<br/>Press 'Delete' or 'Backspace' to remove a selected box.</p></div>}
-                {currentStep === 2 && <TextMatchingPanel text={translationText} onTextChange={setTranslationText} onDownload={handleDownload} />}
+                {currentStep === 1 && <div className="panel-container"><h3>Fine-Tune Detections</h3><p>Click and drag on empty space to draw a new box.<br/>Click a box to select it for moving or resizing.<br/>Hold Shift and click to select multiple boxes.<br/>Press 'Delete' or 'Backspace' to remove selected box(es).</p></div>}
+                {currentStep === 2 && (
+                  <TagClassesPanel 
+                    boxes={finalBoundingBoxes.filter(box => !excludedIndices.includes(box.id))} 
+                    onBoxClassChange={handleBoxClassChange}
+                    selectedBoxIds={selectedBoxIdsForTagging}
+                    onSelectedBoxIdsChange={setSelectedBoxIdsForTagging}
+                  />
+                )}
+                {currentStep === 3 && <ExportCoordinatesPanel onExport={handleExportCSV} boxCount={finalBoundingBoxes.filter(box => !excludedIndices.includes(box.id)).length} />}
               </div>
               <div className="right-panel" ref={fineTunePanelRef}>
                 {currentStep === 0 && (
@@ -857,7 +804,8 @@ const App: FC = () => {
                   )
                 )}
                 {currentStep === 1 && (preprocessedImage ? <FineTuneCanvas image={preprocessedImage} boxes={finalBoundingBoxes} setBoxes={setFinalBoundingBoxes} stageSize={stageSize} /> : <div className="image-placeholder">No image to fine-tune</div>)}
-                {currentStep === 2 && (preprocessedImage ? <TextMatchingCanvas image={preprocessedImage} boxes={clusteredBoxes} text={translationText} /> : <div className="image-placeholder">No image for text matching</div>)}
+                {currentStep === 2 && (preprocessedImage ? <TagClassesCanvas image={preprocessedImage} boxes={finalBoundingBoxes.filter(box => !excludedIndices.includes(box.id))} selectedBoxIds={selectedBoxIdsForTagging} onSelectedBoxIdsChange={setSelectedBoxIdsForTagging} /> : <div className="image-placeholder">No image for tagging</div>)}
+                {currentStep === 3 && (preprocessedImage ? <ExportCoordinatesCanvas image={preprocessedImage} boxes={finalBoundingBoxes.filter(box => !excludedIndices.includes(box.id))} /> : <div className="image-placeholder">No image for export</div>)}
               </div>
             </div>
           </div>
@@ -877,39 +825,61 @@ function bbox_overlap3(box1: BoundingBox, box2: BoundingBox, lpad: number, rpad:
             y2 < y1 + h1 + dpad);
 }
 
-function generateColorCombinations(num: number) {
-    const combinations = [];
-    const saturation = 0.8;
-    const luminance = 0.3;
-    const hueStep = num > 0 ? 1 / num : 0;
-    for (let i = 0; i < num; i++) {
-        const hue = i * hueStep;
-        const [r, g, b] = hslToRgb(hue, saturation, luminance);
-        combinations.push(`rgb(${r},${g},${b})`);
-    }
-    return combinations;
-}
-
-function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-    let r, g, b;
-    if (s === 0) {
-        r = g = b = l;
-    } else {
-        const hue2rgb = (p: number, q: number, t: number) => {
-            if (t < 0) t += 1;
-            if (t > 1) t -= 1;
-            if (t < 1 / 6) return p + (q - p) * 6 * t;
-            if (t < 1 / 2) return q;
-            if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-            return p;
-        };
-        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-        const p = 2 * l - q;
-        r = hue2rgb(p, q, h + 1 / 3);
-        g = hue2rgb(p, q, h);
-        b = hue2rgb(p, q, h - 1 / 3);
-    }
-    return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+/**
+ * Sort bounding boxes by columns (left-to-right) and then by rows (top-to-bottom) within each column.
+ * This matches the original clustering logic for reading order.
+ */
+function sortBoxesByColumns(boxes: BoundingBox[], imageWidth: number): BoundingBox[] {
+    if (boxes.length === 0) return [];
+    
+    // Calculate center X for each box
+    const boxesWithCenters = boxes.map(box => ({
+        box,
+        centerX: box.x + box.w / 2,
+        centerY: box.y + box.h / 2,
+    }));
+    
+    // Estimate column width - use average box width as a threshold
+    const avgBoxWidth = boxes.reduce((sum, box) => sum + box.w, 0) / boxes.length;
+    const columnThreshold = avgBoxWidth * 0.5; // Boxes within 50% of average width are in same column
+    
+    // Group boxes into columns based on X position
+    const columns: BoundingBox[][] = [];
+    const sortedByX = [...boxesWithCenters].sort((a, b) => a.centerX - b.centerX);
+    
+    sortedByX.forEach(({ box, centerX }) => {
+        // Find existing column that this box belongs to
+        let foundColumn = false;
+        for (const column of columns) {
+            // Check if box's X center is close to the column's average X
+            const columnAvgX = column.reduce((sum, b) => sum + (b.x + b.w / 2), 0) / column.length;
+            if (Math.abs(centerX - columnAvgX) < columnThreshold) {
+                column.push(box);
+                foundColumn = true;
+                break;
+            }
+        }
+        
+        // If no matching column found, create a new one
+        if (!foundColumn) {
+            columns.push([box]);
+        }
+    });
+    
+    // Sort columns by their average X position (left to right)
+    columns.sort((col1, col2) => {
+        const avgX1 = col1.reduce((sum, box) => sum + (box.x + box.w / 2), 0) / col1.length;
+        const avgX2 = col2.reduce((sum, box) => sum + (box.x + box.w / 2), 0) / col2.length;
+        return avgX1 - avgX2;
+    });
+    
+    // Sort boxes within each column by Y position (top to bottom)
+    columns.forEach(column => {
+        column.sort((a, b) => a.y - b.y);
+    });
+    
+    // Flatten columns into a single array
+    return columns.flat();
 }
 
 const UploadPanel: FC<UploadPanelProps> = ({ onFileSelect }) => {
@@ -1071,7 +1041,7 @@ interface FineTuneCanvasProps {
 
 const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stageSize }) => {
     const [konvaImage, setKonvaImage] = useState<HTMLImageElement | null>(null);
-    const [selectedBoxId, setSelectedBoxId] = useState<number | null>(null);
+    const [selectedBoxIds, setSelectedBoxIds] = useState<number[]>([]);
     const [hoveredBoxId, setHoveredBoxId] = useState<number | null>(null);
     
     const stageRef = useRef<any>(null);
@@ -1089,24 +1059,32 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
 
     useEffect(() => {
         const handleKeyDown = (e: KeyboardEvent) => {
-            if ((e.key === 'Delete' || e.key === 'Backspace') && selectedBoxId) {
-                setBoxes(boxes.filter(box => box.id !== selectedBoxId));
-                setSelectedBoxId(null);
+            if ((e.key === 'Delete' || e.key === 'Backspace') && selectedBoxIds.length > 0) {
+                setBoxes(boxes.filter(box => !selectedBoxIds.includes(box.id)));
+                setSelectedBoxIds([]);
             }
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedBoxId, boxes, setBoxes]);
+    }, [selectedBoxIds, boxes, setBoxes]);
 
     useEffect(() => {
         const transformer = transformerRef.current;
         if (!transformer) return;
 
-        const targetId = selectedBoxId ?? hoveredBoxId; 
-
-        if (targetId) {
+        // Only show transformer for single selection (multi-selection disables transformation)
+        if (selectedBoxIds.length === 1) {
             const stage = stageRef.current;
-            const targetNode = stage.findOne('#' + targetId);
+            const targetNode = stage.findOne('#' + selectedBoxIds[0]);
+            if (targetNode) {
+                transformer.nodes([targetNode]);
+            } else {
+                transformer.nodes([]);
+            }
+        } else if (selectedBoxIds.length === 0 && hoveredBoxId) {
+            // Show transformer on hover when nothing is selected
+            const stage = stageRef.current;
+            const targetNode = stage.findOne('#' + hoveredBoxId);
             if (targetNode) {
                 transformer.nodes([targetNode]);
             } else {
@@ -1115,7 +1093,7 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
         } else {
             transformer.nodes([]);
         }
-    }, [selectedBoxId, hoveredBoxId]);
+    }, [selectedBoxIds, hoveredBoxId]);
     
     const getScale = () => {
         if (!konvaImage || !stageSize.width || !stageSize.height) {
@@ -1143,7 +1121,10 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
             const pos = e.target.getStage()!.getPointerPosition()!;
             const originalPos = toOriginalCoords(pos);
             drawingRectRef.current = { x: originalPos.x, y: originalPos.y, w: 0, h: 0 };
-            setSelectedBoxId(null);
+            // Clear selection if not holding Shift
+            if (!e.evt.shiftKey) {
+                setSelectedBoxIds([]);
+            }
         }
     };
     
@@ -1168,6 +1149,7 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
                     h: Math.abs(h),
                     area: Math.abs(w * h),
                     id: Date.now(),
+                    class: 'Man', // Default class
                 };
                 setBoxes([...boxes, newBox]);
             }
@@ -1194,21 +1176,56 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
                         y={box.y}
                         width={box.w}
                         height={box.h}
-                        stroke={selectedBoxId === box.id ? 'cyan' : hoveredBoxId === box.id ? 'yellow' : 'red'}
-                        strokeWidth={2 / scale} // Keep stroke width consistent on zoom
+                        stroke={selectedBoxIds.includes(box.id) ? 'cyan' : hoveredBoxId === box.id ? 'yellow' : 'red'}
+                        strokeWidth={selectedBoxIds.includes(box.id) ? 3 / scale : 2 / scale} // Thicker stroke for selected
                         hitStrokeWidth={20 / scale} // Increase hit area for easier interaction
-                        draggable
-                        onClick={() => {
-                            setSelectedBoxId(box.id);
+                        draggable={selectedBoxIds.length <= 1} // Only allow dragging single selection
+                        onClick={(e) => {
+                            const isSelected = selectedBoxIds.includes(box.id);
+                            if (e.evt.shiftKey) {
+                                // Multi-select mode: toggle the clicked box
+                                if (isSelected) {
+                                    setSelectedBoxIds(selectedBoxIds.filter(id => id !== box.id));
+                                } else {
+                                    setSelectedBoxIds([...selectedBoxIds, box.id]);
+                                }
+                            } else {
+                                // Single click: replace selection with just this box
+                                if (isSelected && selectedBoxIds.length === 1) {
+                                    // If it's the only selected box, deselect it
+                                    setSelectedBoxIds([]);
+                                } else {
+                                    // Otherwise, select only this box
+                                    setSelectedBoxIds([box.id]);
+                                }
+                            }
                             setHoveredBoxId(null);
                         }}
-                        onTap={() => {
-                            setSelectedBoxId(box.id);
+                        onTap={(e) => {
+                            const isSelected = selectedBoxIds.includes(box.id);
+                            if (e.evt.shiftKey) {
+                                // Multi-select mode: toggle the clicked box
+                                if (isSelected) {
+                                    setSelectedBoxIds(selectedBoxIds.filter(id => id !== box.id));
+                                } else {
+                                    setSelectedBoxIds([...selectedBoxIds, box.id]);
+                                }
+                            } else {
+                                // Single tap: replace selection with just this box
+                                if (isSelected && selectedBoxIds.length === 1) {
+                                    setSelectedBoxIds([]);
+                                } else {
+                                    setSelectedBoxIds([box.id]);
+                                }
+                            }
                             setHoveredBoxId(null);
                         }}
                         onMouseEnter={() => setHoveredBoxId(box.id)}
                         onMouseLeave={() => setHoveredBoxId(null)}
                         onTransformEnd={(e) => {
+                            // Only allow transform for single selection
+                            if (selectedBoxIds.length !== 1 || !selectedBoxIds.includes(box.id)) return;
+                            
                             const node = e.target;
                             const newScaleX = node.scaleX();
                             const newScaleY = node.scaleY();
@@ -1226,6 +1243,9 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
                             setBoxes(newBoxes);
                         }}
                         onDragEnd={(e) => {
+                            // Only allow drag for single selection
+                            if (selectedBoxIds.length !== 1 || !selectedBoxIds.includes(box.id)) return;
+                            
                             const newBoxes = boxes.map(b => 
                                 b.id === box.id ? { ...b, x: e.target.x(), y: e.target.y() } : b
                             );
@@ -1259,37 +1279,221 @@ const FineTuneCanvas: FC<FineTuneCanvasProps> = ({ image, boxes, setBoxes, stage
     );
 };
 
-interface TextMatchingPanelProps {
-    text: string;
-    onTextChange: (text: string) => void;
-    onDownload: () => void;
+interface TagClassesPanelProps {
+    boxes: BoundingBox[];
+    onBoxClassChange: (boxIds: number[], boxClass: BoxClass | undefined) => void;
+    selectedBoxIds: number[];
+    onSelectedBoxIdsChange: (boxIds: number[]) => void;
 }
 
-const TextMatchingPanel: FC<TextMatchingPanelProps> = ({ text, onTextChange, onDownload }) => {
+const TagClassesPanel: FC<TagClassesPanelProps> = ({ boxes, onBoxClassChange, selectedBoxIds, onSelectedBoxIdsChange }) => {
+    const selectedBoxes = boxes.filter(box => selectedBoxIds.includes(box.id));
+    const classOptions: BoxClass[] = ['Man', 'Chi', 'Frame'];
+    
+    // Check if all selected boxes have the same class
+    const getCommonClass = (): BoxClass | undefined => {
+        if (selectedBoxes.length === 0) return undefined;
+        const firstClass = selectedBoxes[0].class;
+        if (selectedBoxes.every(box => box.class === firstClass)) {
+            return firstClass;
+        }
+        return undefined;
+    };
+    
+    const commonClass = getCommonClass();
+    
     return (
         <div className="panel-container">
-            <h3>Enter Text</h3>
-            <p>Enter the corresponding text for each column, with each line representing a new column, from left to right.</p>
-            <textarea
-                value={text}
-                onChange={(e) => onTextChange(e.target.value)}
-                placeholder="Enter text for each column, one line per column..."
-                style={{ width: '100%', height: '200px', boxSizing: 'border-box' }}
-            />
-            <button onClick={onDownload} className="button-style">
-                Download Word Images
+            <h3>Tag Classes</h3>
+            <p>Click on bounding boxes in the image to select them (you can select multiple), then choose a class to tag all selected boxes at once.</p>
+            {selectedBoxIds.length > 0 ? (
+                <div style={{ marginTop: '1rem' }}>
+                    <p style={{ fontSize: '0.75rem', color: '#8b949e', marginBottom: '0.5rem' }}>
+                        Selected: <strong>{selectedBoxIds.length}</strong> box{selectedBoxIds.length > 1 ? 'es' : ''}
+                    </p>
+                    {commonClass && (
+                        <p style={{ fontSize: '0.625rem', color: '#8b949e', marginBottom: '0.5rem' }}>
+                            All selected boxes are tagged as: <strong>{commonClass}</strong>
+                        </p>
+                    )}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                        {classOptions.map((boxClass) => (
+                            <button
+                                key={boxClass}
+                                onClick={() => {
+                                    onBoxClassChange(selectedBoxIds, boxClass);
+                                }}
+                                className="button-style"
+                                style={{
+                                    backgroundColor: commonClass === boxClass ? 'var(--primary)' : 'var(--muted)',
+                                    fontSize: '0.5rem',
+                                }}
+                            >
+                                Tag as {boxClass} {commonClass === boxClass ? '✓' : ''}
+                            </button>
+                        ))}
+                        <button
+                            onClick={() => {
+                                onBoxClassChange(selectedBoxIds, undefined);
+                            }}
+                            className="button-style"
+                            style={{
+                                backgroundColor: !commonClass ? 'var(--primary)' : 'var(--muted)',
+                                fontSize: '0.5rem',
+                            }}
+                        >
+                            Clear Tags {!commonClass ? '✓' : ''}
+                        </button>
+                    </div>
+                </div>
+            ) : (
+                <p style={{ fontSize: '0.625rem', color: '#8b949e', marginTop: '0.5rem' }}>
+                    No boxes selected. Click on boxes in the image to select them (hold Shift to select multiple).
+                </p>
+            )}
+            <div style={{ marginTop: '1rem', fontSize: '0.625rem', color: '#8b949e' }}>
+                <p>Tagged: {boxes.filter(box => box.class).length} / {boxes.length}</p>
+            </div>
+        </div>
+    );
+};
+
+interface TagClassesCanvasProps {
+    image: string | null;
+    boxes: BoundingBox[];
+    selectedBoxIds: number[];
+    onSelectedBoxIdsChange: (boxIds: number[]) => void;
+}
+
+const TagClassesCanvas: FC<TagClassesCanvasProps> = ({ image, boxes, selectedBoxIds, onSelectedBoxIdsChange }) => {
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+
+    useEffect(() => {
+        if (image && canvasRef.current) {
+            const canvas = canvasRef.current;
+            const context = canvas.getContext('2d');
+            if (!context) return;
+
+            const img = new Image();
+            img.src = image;
+            img.onload = () => {
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                context.drawImage(img, 0, 0);
+
+                if (boxes.length > 0) {
+                    boxes.forEach(box => {
+                        // Color based on class
+                        let strokeColor = 'red';
+                        if (box.class === 'Man') strokeColor = 'blue';
+                        else if (box.class === 'Chi') strokeColor = 'green';
+                        else if (box.class === 'Frame') strokeColor = 'orange';
+                        
+                        // Highlight selected boxes
+                        if (selectedBoxIds.includes(box.id)) {
+                            context.strokeStyle = 'cyan';
+                            context.lineWidth = 5;
+                        } else {
+                            context.strokeStyle = strokeColor;
+                            context.lineWidth = 3;
+                        }
+                        context.strokeRect(box.x, box.y, box.w, box.h);
+                        
+                        // Draw class label if tagged
+                        if (box.class) {
+                            context.fillStyle = strokeColor;
+                            context.font = 'bold 20px Arial';
+                            context.fillText(box.class, box.x, box.y - 5);
+                        }
+                    });
+                }
+            };
+        }
+    }, [image, boxes, selectedBoxIds]);
+
+    const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+        if (!canvasRef.current) return;
+        
+        const canvas = canvasRef.current;
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        
+        const x = (e.clientX - rect.left) * scaleX;
+        const y = (e.clientY - rect.top) * scaleY;
+        
+        // Find clicked box
+        const clickedBox = boxes.find(box => 
+            x >= box.x && x <= box.x + box.w &&
+            y >= box.y && y <= box.y + box.h
+        );
+        
+        if (clickedBox) {
+            const isSelected = selectedBoxIds.includes(clickedBox.id);
+            if (e.shiftKey) {
+                // Multi-select mode: toggle the clicked box
+                if (isSelected) {
+                    onSelectedBoxIdsChange(selectedBoxIds.filter(id => id !== clickedBox.id));
+                } else {
+                    onSelectedBoxIdsChange([...selectedBoxIds, clickedBox.id]);
+                }
+            } else {
+                // Single click: replace selection with just this box
+                if (isSelected && selectedBoxIds.length === 1) {
+                    // If it's the only selected box, deselect it
+                    onSelectedBoxIdsChange([]);
+                } else {
+                    // Otherwise, select only this box
+                    onSelectedBoxIdsChange([clickedBox.id]);
+                }
+            }
+        } else {
+            // Clicked outside any box - clear selection if not holding Shift
+            if (!e.shiftKey) {
+                onSelectedBoxIdsChange([]);
+            }
+        }
+    };
+
+    return (
+        <canvas 
+            ref={canvasRef} 
+            style={{ maxWidth: '100%', maxHeight: '100%', cursor: 'pointer' }}
+            onClick={handleCanvasClick}
+        />
+    );
+};
+
+interface ExportCoordinatesPanelProps {
+    onExport: () => void;
+    boxCount: number;
+}
+
+const ExportCoordinatesPanel: FC<ExportCoordinatesPanelProps> = ({ onExport, boxCount }) => {
+    return (
+        <div className="panel-container">
+            <h3>Export Coordinates</h3>
+            <p>Export bounding box coordinates in YOLO format for training your word detection model.</p>
+            <p style={{ fontSize: '0.75rem', color: '#8b949e', marginTop: '0.5rem' }}>
+                Detected boxes: <strong>{boxCount}</strong>
+            </p>
+            <p style={{ fontSize: '0.625rem', color: '#8b949e', marginTop: '0.5rem' }}>
+                Format: filename, class, x_center, y_center, width, height<br/>
+                (All coordinates are normalized between 0 and 1)
+            </p>
+            <button onClick={onExport} className="button-style" disabled={boxCount === 0}>
+                Export CSV
             </button>
         </div>
     );
 };
 
-interface TextMatchingCanvasProps {
+interface ExportCoordinatesCanvasProps {
     image: string | null;
     boxes: BoundingBox[];
-    text: string;
 }
 
-const TextMatchingCanvas: FC<TextMatchingCanvasProps> = ({ image, boxes, text }) => {
+const ExportCoordinatesCanvas: FC<ExportCoordinatesCanvasProps> = ({ image, boxes }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -1306,40 +1510,28 @@ const TextMatchingCanvas: FC<TextMatchingCanvasProps> = ({ image, boxes, text })
             context.drawImage(img, 0, 0);
 
             if (boxes.length > 0) {
-              const textsByCol = text.split('\n');
-              const clusters = [...new Set(boxes.map(b => b.cluster))].sort((a,b) => a! - b!);
-              const colors = generateColorCombinations(clusters.length);
-
-              const boxesWithText = boxes.map(box => {
-                const clusterIndex = clusters.indexOf(box.cluster);
-                if(clusterIndex !== -1 && clusterIndex < textsByCol.length) {
-                    const sortedBoxesInCluster = boxes.filter(b => b.cluster === box.cluster).sort((a,b) => a.y - b.y);
-                    const boxIndex = sortedBoxesInCluster.findIndex(b => b.id === box.id);
-                    const wordsInText = textsByCol[clusterIndex].split(/\s+/);
-                    if (boxIndex !== -1 && boxIndex < wordsInText.length) {
-                        return { ...box, text: wordsInText[boxIndex] };
-                    }
-                }
-                return box;
-              });
-
-              boxesWithText.forEach(box => {
-                  const clusterIndex = clusters.indexOf(box.cluster);
-                  const color = clusterIndex !== -1 ? colors[clusterIndex % colors.length] : 'rgba(255, 0, 0, 0.5)';
-                  context.strokeStyle = color;
-                  context.lineWidth = 5;
+              // Draw boxes with colors based on class
+              boxes.forEach(box => {
+                  let strokeColor = 'red'; // Default for untagged
+                  if (box.class === 'Man') strokeColor = 'blue';
+                  else if (box.class === 'Chi') strokeColor = 'green';
+                  else if (box.class === 'Frame') strokeColor = 'orange';
+                  
+                  context.strokeStyle = strokeColor;
+                  context.lineWidth = 3;
                   context.strokeRect(box.x, box.y, box.w, box.h);
-
-                  if (box.text) {
-                      context.fillStyle = 'red';
-                      context.font = '40px Arial';
-                      context.fillText(box.text, box.x, box.y - 10);
+                  
+                  // Draw class label if tagged
+                  if (box.class) {
+                      context.fillStyle = strokeColor;
+                      context.font = 'bold 20px Arial';
+                      context.fillText(box.class, box.x, box.y - 5);
                   }
               });
             }
         };
     }
-  }, [image, boxes, text]);
+  }, [image, boxes]);
 
     return <canvas ref={canvasRef} style={{ maxWidth: '100%', maxHeight: '100%' }} />;
 };
