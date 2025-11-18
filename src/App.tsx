@@ -1284,9 +1284,10 @@ interface TagClassesPanelProps {
     boxes: BoundingBox[];
     onBoxClassChange: (boxIds: number[], boxClass: BoxClass | undefined) => void;
     selectedBoxIds: number[];
+    onSelectedBoxIdsChange: (boxIds: number[]) => void;
 }
 
-const TagClassesPanel: FC<TagClassesPanelProps> = ({ boxes, onBoxClassChange, selectedBoxIds }) => {
+const TagClassesPanel: FC<TagClassesPanelProps> = ({ boxes, onBoxClassChange, selectedBoxIds, onSelectedBoxIdsChange: _onSelectedBoxIdsChange }) => {
     const selectedBoxes = boxes.filter(box => selectedBoxIds.includes(box.id));
     const classOptions: BoxClass[] = ['Man', 'Chi', 'Frame'];
     
